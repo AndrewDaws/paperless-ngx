@@ -10,6 +10,7 @@ from typing import Optional
 
 from dateutil.parser import isoparse
 from django.conf import settings
+from django.db.models import QuerySet
 from django.utils import timezone as django_timezone
 from guardian.shortcuts import get_users_with_perms
 from whoosh import classify
@@ -22,6 +23,8 @@ from whoosh.fields import NUMERIC
 from whoosh.fields import TEXT
 from whoosh.fields import Schema
 from whoosh.highlight import HtmlFormatter
+from whoosh.idsets import BitSet
+from whoosh.idsets import SortedIntSet
 from whoosh.index import FileIndex
 from whoosh.index import create_in
 from whoosh.index import exists_in
@@ -340,13 +343,50 @@ class DelayedQuery:
         else:
             return sort_fields_map[field], reverse
 
-    def __init__(self, searcher: Searcher, query_params, page_size, user):
+    def __init__(
+        self,
+        searcher: Searcher,
+        query_params,
+        page_size,
+        user,
+        filter_queryset: Optional[QuerySet] = None,
+    ):
         self.searcher = searcher
         self.query_params = query_params
         self.page_size = page_size
         self.saved_results = dict()
         self.first_score = None
         self.user = user
+        self.filter_queryset = filter_queryset
+
+    def _get_docnum_filter_set(self):
+        if self.filter_queryset is None:
+            return None
+
+        index_size = self.searcher.doc_count_all()
+        document_ids = self.filter_queryset.values_list("id", flat=True)
+        document_count = document_ids.count()
+
+        if not document_count:
+            # A set that doesn't match any document but evaluates to True.
+            # This hack is needed because "falsy" filters are ignored.
+            return SortedIntSet([index_size])
+
+        docnums = BitSet(size=index_size)
+
+        # A simple heuristic to pick the faster way of mapping document numbers
+        if document_count < index_size / math.log2(index_size + 1):
+            # This seems to be around O(len(filter_queryset) log index_size)
+            for document_id in document_ids:
+                docnums.add(self.searcher.document_number(id=document_id))
+        else:
+            # This seems to be around O(index_size)
+            document_ids = set(document_ids)
+            for docnum in self.searcher.document_numbers():
+                if self.searcher.ixreader.stored_fields(docnum)["id"] in document_ids:
+                    docnums.add(docnum)
+
+        return docnums
 
     def __len__(self):
         page = self[0:1]
@@ -362,7 +402,7 @@ class DelayedQuery:
         page: ResultsPage = self.searcher.search_page(
             q,
             mask=mask,
-            filter=self._get_query_filter(),
+            filter=self._get_docnum_filter_set(),
             pagenum=math.floor(item.start / self.page_size) + 1,
             pagelen=self.page_size,
             sortedby=sortedby,
